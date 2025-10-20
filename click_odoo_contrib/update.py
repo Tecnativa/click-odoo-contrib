@@ -18,6 +18,7 @@ from click_odoo import OdooEnvironment, odoo
 from ._addon_hash import addon_hash
 from ._dbutils import advisory_lock
 from .core_addons import core_addons
+from .manifest import read_manifest
 
 _logger = logging.getLogger(__name__)
 
@@ -176,6 +177,58 @@ def _get_checksum_dir(cr, module_name):
     return checksum_dir
 
 
+def _check_auto_install_modules(cr, ignore_addons=None):
+    """Check for auto_install modules that should be installed but aren't.
+
+    Log warnings for modules that have auto_install=True, are installable,
+    have all dependencies installed, but are not installed themselves.
+    """
+    if ignore_addons is None:
+        ignore_addons = set()
+
+    # Get all installed module names for dependency checking
+    cr.execute("SELECT name FROM ir_module_module WHERE state='installed'")
+    installed_modules = {row[0] for row in cr.fetchall()}
+
+    # Get all non-installed modules
+    cr.execute("SELECT name FROM ir_module_module WHERE state != 'installed'")
+    uninstalled_modules = [row[0] for row in cr.fetchall()]
+
+    for module_name in uninstalled_modules:
+        # Skip if in ignore list
+        if module_name in ignore_addons:
+            continue
+
+        # Get module path and read manifest
+        module_path = odoo.modules.module.get_module_path(module_name)
+        if not module_path or not os.path.isdir(module_path):
+            continue
+
+        try:
+            manifest = read_manifest(module_path)
+        except Exception:
+            # Skip modules without valid manifests
+            continue
+
+        # Check if module has auto_install=True and is installable
+        if not manifest.get("auto_install", False):
+            continue
+        if not manifest.get("installable", True):
+            continue
+
+        # Get dependencies (defaults to ['base'] if not specified)
+        dependencies = manifest.get("depends", ["base"])
+
+        # Check if all dependencies are installed
+        if all(dep in installed_modules for dep in dependencies):
+            _logger.warning(
+                "Module '%s' has auto_install=True and all dependencies are "
+                "installed (%s), but the module is not installed",
+                module_name,
+                ", ".join(dependencies),
+            )
+
+
 def _update_db_nolock(
     conn,
     database,
@@ -222,6 +275,7 @@ def _update_db_nolock(
         raise click.Abort("Update aborted by watcher, check logs")
     with conn.cursor() as cr:
         _save_installed_checksums(cr, ignore_addons)
+        _check_auto_install_modules(cr, ignore_addons)
 
 
 def _update_db(
